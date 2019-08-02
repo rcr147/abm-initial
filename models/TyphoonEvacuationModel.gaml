@@ -26,7 +26,7 @@ global {
 	float time_before_hazard <- 1#h ;
 	bool stay <- true;
 	
-	shape_file rectangle <- shape_file("../includes/rectangle.shp");
+	//shape_file rectangle <- shape_file("../includes/rectangle.shp");
 	file road_file <- file("../includes/roads.shp");
 	file buildings <- file("../includes/buildings.shp");
 	file water_body <- file("../includes/waterways.shp");

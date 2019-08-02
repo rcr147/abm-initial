@@ -26,11 +26,14 @@ global {
 	float time_before_hazard <- 1#h ;
 	bool stay <- true;
 	
+	//shape_file rectangle <- shape_file("../includes/rectangle.shp");
 	file road_file <- file("../includes/roads.shp");
 	file buildings <- file("../includes/buildings.shp");
 	file water_body <- file("../includes/waterways.shp");
 	
 	geometry shape <- envelope(envelope(road_file)+envelope(water_body));
+	//geometry shape <- envelope(rectangle);
+	
 //	
 	graph<geometry, geometry> road_network;
 	map<road,float> road_weights;
@@ -44,6 +47,7 @@ global {
 
 	init 
 	{
+		//list<geometry> clean_lines <- clean_network(road_file.contents, 5, true, true);
 		create road from:road_file;
 		create building from:buildings;
 		create hazard from: water_body;
@@ -69,6 +73,8 @@ global {
 		
 		road_network <- as_edge_graph(road);
 		road_weights <- road as_map (each::each.shape.perimeter);
+		
+		
 		
 //		create MDRRMO;
 		

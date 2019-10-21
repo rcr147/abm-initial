@@ -1,7 +1,7 @@
 /***
-* Name: TyphoonEvacuationGrid
-* Author: reyrodrigueza
-* Description: An initail model of typhoon evacuation behavior using grid
+* Name: TyphoonEvacuationModel
+* Author: Rey C. Rodrigueza	09-2019
+* Description: An initial model of typhoon evacuation behavior 
 * Tags: Tag1, Tag2, TagN
 ***/
 
@@ -10,133 +10,575 @@ model TyphoonEvacuationModel
 /* Insert your model definition here 
  * */
 
-global {
+global 
+{
+	float step <- 10 #s;				//a step represents 10 seconds
+	
 	int nb_rescuers_init <- 5;			//initial number of rescuers
 	int nb_households_init <- 10;		//initial number of households
-	int nb_houses_init <- 20;			//initial number of houses
-	int nb_shelterManagers_init <- 2;	//initial number of shelter managers
+	int nb_shelterManagers_init <- 4;	//initial number of shelter managers
+
 	
-	float floodHeight_init <- 0.0;
-	float floodWaterFlowSpeed <- 0.0;
-	float stormIntensity <- 0.0;
-	float rainfallIntensity <- 0.0;
+	float hhPerceptionDistance <- 50#m;		//household perception distance
+	float resPerceptionDistance <- 50#m;	//rescuer perception distance
+	float sheltPerceptionDistance <- 5#m;	//shelter manager perception distance
+	
+	int evacuated_inside <- 0;			//number of households who evacuated within the barangay
+	int evacuated_outside <- 0;			//number of households who evacuated outside the barangay
+	int total_evacuees <- 0;			//total number of evacuees
+	int availableEvacuationCenters;
+	int availableVolunteerCenters; 
+	
+	float init_probability_cooperation <- 0.5;
+	
+//	float floodHeight_init <- 0.0;
+//	float floodWaterFlowSpeed <- 0.0;
+	
+	// HAZARD-RELATED FACTORS
+	int stormSeverity;					//storm signal [1,2,3,4,5]
+	string rainfallSeverity;			//rainfall classification [yellow,orange,red]
+	float proximityToHazard <- 0.0;		//distance from household location to source of hazard
+	//float sourceOfEvacuationWarning <- 0.0;
+	string timeOfDay <- "Daytime";		//day or night
 	float tideLevel <- 0.0;
+	float _stormSeverity;
+	float _rainfallSeverity;
+	float _timeOfDay;
+	
+	bool directed;		// whether disaster manager commands rescuers 
 	
 	date catastrophe_date;
 	float time_before_hazard <- 1#h ;
-	bool stay <- true;
 	
-	//shape_file rectangle <- shape_file("../includes/rectangle.shp");
+	//DECISION FACTORS WEIGHT
+	float weight_CDM <- 0.0;					//weight for characteristics of decision maker
+	float weight_HRF <- 0.0;					//weight for house-related factors
+	float weight_CRF <- 0.0;					//weight for capacity-related factors
+	
+	float hhHighestPossibleScore;		//highest perceived risk score for a household
+	
+	// SHAPEFILES
 	file road_file <- file("../includes/roads.shp");
 	file buildings <- file("../includes/buildings.shp");
 	file water_body <- file("../includes/waterways.shp");
+	file points <- file("../includes/points.shp");
+	file evacuationPoints <- file("../includes/evacuationPoints.shp");
+	file officialEvacuationCenters <- file("../includes/OfficialEvacuationCenters.shp");
+	file additionalShelters <- file("../includes/VolunteerShelters.shp");
+	file destinationPoints <- file("../includes/destinationPoints.shp");
 	
 	geometry shape <- envelope(envelope(road_file)+envelope(water_body));
 	//geometry shape <- envelope(rectangle);
-	
-//	
+		
 	graph<geometry, geometry> road_network;
+	graph<geometry, geometry> rescuers_road_network;
+	graph<geometry, geometry> households_road_network;
+	
 	map<road,float> road_weights;
-//	
+	
+	//SPECIES SHUFFLED
+	list<building> buildingShuff;
+	list<rescuers> rescuersShuff;
+	list<households> householdsShuff;
+	list<shelterManagers> managersShuff;
+	list<rescuersStartingPoints> rescuersStartingPointsShuff;
+	list<volunteerShelters> volunteerSheltersShuff;
+	list<evacuationCenters> evacuationCentersShuff;
+	
 	int xbounds <- int(shape.width/10); 
 	int ybounds <- int(shape.height/10); 
 	int xmin <- xbounds;   
 	int ymin <- ybounds;  
 	int xmax <- int(shape.width - xbounds);     
 	int ymax <- int(shape.height - ybounds);
+	
+	float x <- 0.0;				//cooperator_totalNeighbor_ratio;
+	float D <- 2*x - 0.5;		//payoff curve for defectors
+	float C <- 2*x - 1.0;		//payoff curve for cooperators
 
 	init 
 	{
 		//list<geometry> clean_lines <- clean_network(road_file.contents, 5, true, true);
-		create road from:road_file;
+		list<geometry> clean_roads <- clean_network(road_file.contents,0.0,true,false); //thanks to Dr.Kevin Chapuis for this line
+		create road from:clean_roads;
 		create building from:buildings;
 		create hazard from: water_body;
+		create rescuersStartingPoints from: points;
+		create householdsEvacuationPoints from: evacuationPoints;
 		
-		create households number:nb_households_init {
-			location <- any_location_in(one_of(building));
-//			safety_point <- evacuation_point with_min_of (each distance_to self);
-		}		
+		create rescuersDestinationPoints from: destinationPoints
+		{
+			reached <- false;
+		}
+		
+		
+		create evacuationCenters from: officialEvacuationCenters with: [evacuationCenterCapacity::string(get("capacity"))]
+		{
+			evacCenterManager <- shelterManagers closest_to(self); 
+			acceptedEvacuees <- 0;
+			full <- false;
+		}
+		
+		create volunteerShelters from: additionalShelters with: [volunteerShelterCapacity::string(get("capacity"))]
+		{
+			acceptedVEvacuees <- 0;
+			full <- false;
+		}
+		
+		//AGENTS' ROAD NETWORK
+		households_road_network <- as_edge_graph(road);
+		rescuers_road_network <- as_edge_graph(road);
+		road_network <- as_edge_graph(road);
+		road_weights <- road as_map (each::each.shape.perimeter);
+		
+		//SPECIES SHUFFLED
+		buildingShuff <- shuffle(building);
+		rescuersShuff <- shuffle(rescuers);
+		householdsShuff <- shuffle(households);
+		managersShuff <- shuffle(shelterManagers);
+		rescuersStartingPointsShuff <- shuffle(rescuersStartingPoints);
+		volunteerSheltersShuff <- shuffle(volunteerShelters);
+		evacuationCentersShuff <- shuffle(evacuationCenters);
+		
+		availableEvacuationCenters <- length(evacuationCentersShuff);
+		availableVolunteerCenters <- length(volunteerShelters);
+		
+		
+		create households from:csv_file( "../includes/householdAgents.csv",true) with:
+			[hhID::int(get("HouseholdID")), 
+				headOfHousehold::string(get("HeadOfHousehold")), 
+				incomeLevel::string(get("IncomeLevel")),
+				levelOfEducation::string(get("LevelOfEducation")), 
+				hasSmallKids::bool(get("PresenceOfChildren")),
+				hasElderly::bool(get("PresenceOfElderly")),
+				withDisability::bool(get("PresenceOfDisabledMembers")),
+				houseOwnership::bool(get("HouseOwnership")),
+				yearsOfResidency::bool(get("YearsOfResidency")),
+				pastTyphoonExperience::bool(get("TyphoonExperience"))
+			]	
+			{	//thanks to Dr.Alexis Drogoul for this part
+				choice <- first(buildingShuff);
+				remove choice from: buildingShuff;
+				location <- any_location_in(choice);
+				speed <- rnd(2, 5)#km/#h;
+				//location <- any_location_in(one_of(building));
+			}
+			
+			
+//		list<string> names <- households collect each.name; // each is of type my_species
+			
+		
+//		create households number:nb_households_init 
+//		{	
+//			location <- any_location_in(one_of(building));
+////			location <- one_of(building);
+////			safety_point <- evacuation_point with_min_of (each distance_to self);
+//		}		
 		
 		create rescuers number:nb_rescuers_init
 		{
-			location <- any_location_in(one_of(building));
+//			rescuer <- first(rescuersShuff);	
+//			startingPoint <- first(rescuersStartingPointsShuff);
+//			remove startingPoint from: rescuersStartingPointsShuff;
+//			location <- any_location_in(startingPoint);
+
+			location <- any_location_in(one_of(points));
+			startPoint <- location;
 //			evacuation_point start <- any_location_in(one_of(building));
 //			location <-start.location;
 //			capacity <- nb_capacity;
 //			home <- start;
 		}
-		
+				
 		create shelterManagers number:nb_shelterManagers_init
 		{
-			location <- any_location_in(one_of(building));
+			evacCenter <- first(evacuationCentersShuff);
+			remove evacCenter from: evacuationCentersShuff;
+			location <- any_location_in(evacCenter);
+			//capacity <- int(evacCenter.evacuationCenterCapacity); // deadlock code
+			acceptedEvacuees <- 0;
+			full <- false;
 		}		
 		
-		road_network <- as_edge_graph(road);
-		road_weights <- road as_map (each::each.shape.perimeter);
 		
 		
-		
+			
 //		create MDRRMO;
-		
+
+//		//CONVERTING INPUT VALUES 
+//		if(rainfallSeverity = "Yellow") 		{	_rainfallSeverity <- 0.4;	}
+//		else if(rainfallSeverity = "Orange")	{	_rainfallSeverity <- 0.7;	}
+//		else if(rainfallSeverity = "Red")		{	_rainfallSeverity <- 1.0;	}
+//		
+//		if(timeOfDay = "Day time")			{	_timeOfDay <- 0.5;	}
+//		else if(timeOfDay = "Night time")	{	_timeOfDay <- 1.0;	}
+//		
+//		switch stormSeverity 
+//		{
+//			match 1	{	_stormSeverity <- 0.4;	}
+//			match 2 {	_stormSeverity <- 0.7;	}
+//			match 3	{	_stormSeverity <- 1.0;	}
+//			default {	_stormSeverity <- 1.0;	}
+//		}
 	}
+		
+//  reflex countAvailableEvacuationCenters when: !empty(evacuationCenters)
+//	{
+//		//TODO 
+//		loop EC over: evacuationCenters
+//		{
+//			if(EC.full) 
+//			{ 
+//				remove EC from: evacuationCenters;
+//				availableEvacuationCenters <- availableEvacuationCenters - 1;
+//				write "availableEvacuationCenters:" + availableEvacuationCenters;
+//			}
+//		}
+//	} 
+	
+	
+//	reflex halting when: empty (rescuersDestinationPoints) 
+//	{
+//		do halt;
+//	}
+	
+//	action recompute {
+//		road_network <- as_edge_graph(road where !each.is_flooded);
+//		using topology(road_network) {
+//			ask inhabitant where !each.is_evacuated {
+//				safety_point <- evacuation_point closest_to self;
+//			}
+//		}
+//	}
+	
 }
-
-
-species households skills:[moving] {
+	
+species households skills:[moving] 
+{
+	int hhID <- 0;		// agent ID
+	
+	building choice;
+	bool alerted <- false;
+	bool wander <- false;
+	bool stay <- true;
+	bool evacuateNow <- false;
+	
+	float speed;
+	//float perceptionDistance <- 50#m;
+	
+	//list<building> neighbors update: building at_distance vicinity_distance;
+	
+	/* DECISION FACTORS */
+	
+	// CHARACTERISTICS OF DECISION MAKER
+	string headOfHousehold;
+	string incomeLevel;
+	string levelOfEducation;
+	bool hasSmallKids;
+	bool hasElderly;
+	bool withDisability;
+	bool houseOwnership;
+	bool yearsOfResidency;
+	
+	
+	// HAZARD-RELATED FACTORS
+	// This also includes stormSeverity, rainfallSeverity, proximityToHazard 
+	// which are declared as global variables
+	string sourceOfEvacuationWarning;
+	float _sourceOfEvacuationWarning;	// could be rescuers, family/friends or media
+	
+	
+	// CAPACITY-RELATED FACTORS
+	string houseQuality <- nil;
+	float floorLevels <- 0.0;
+	bool pastTyphoonExperience <- nil;
+	// float houseDamage <- 0.0;			TO BE COMPUTED
+	
+	// PERCEIVED RISK
 	float vitality <- 0.0;
 	float perceivedRisk <- 0.0;
-	float headOfHousehold <- 0.0;
-	float levelOfEducation <- 0.0;
-	float hasSmallKids <- 0.0;
-	float hasElderly <- 0.0;
-	float withDisability <- 0.0;
-	float houseRented <- 0.0;
-	float yearsOfResidency <- 0.0;
-	float pastTyphoonExperience <- 0.0;
-	float stormSeverity <- 0.0;
-	float rainfallSeverity <- 0.0;
-	float proximityToHazard <- 0.0;
-	float sourceOfTyphoonInformation <- 0.0;
-	float sourceOfEvacuationWarning <- 0.0;
-	int totalNeighborhood <- 0;
 	
-	//households<list> neighborhood <- null;
-	float houseQuality <- 0.0;
-	float floorLevels <- 0.0;
-	float houseDamage <- 0.0;
+	// DECISION FACTORS TOTAL VALUES
+	float CDM <- 0.0;
+	float HRF <- 0.0;
+	float CRF <- 0.0;
+	
+	//float cooperator_totalNeighbor_ratio <- 0.0;
+	
+	// NEIGHBORS
+	int totalNeighborhood <- 0;
+	//list<households> neighbours <- shuffle(households.near);
+ 
 	
 	//Graph roadNetwork
-	float priority;
+	//float priority;
 	float size;
 	
 	rgb color <- rgb(255,255,179);
 	
-	reflex calculate_priority 
+	init
 	{
-		priority <- self.location distance_to hazard[0];
+		do compute_CharacteristicsOfDecisionMaker();
+		do compute_CapacityRelatedFactors();
+		
+		if(flip(0.5))	{	_sourceOfEvacuationWarning <- 0.4;		}	//friends
+		else			{	_sourceOfEvacuationWarning <- 0.7;		}	//media
+		
+		if(flip(0.3))	{	floorLevels <- 0.5;		}	//the building/house has more than 1 floor levels
+		else			{	floorLevels <- 1.0;		}	//the building/house has 1 floor level
+	}
+	
+	
+	/* BEHAVIORS */
+	reflex wander when: alerted or wander 
+	{
+		// Wanders around building when not evacuating.
+		do wander speed: speed amplitude: 0.5 bounds: choice;
+	}
+	
+	reflex listNeighbors 
+	{
+		// Neighbors contains the list of all the household agents within the perception 
+		// distance of the caller household agent.
+		list<households> neighbors <- households at_distance(hhPerceptionDistance);
+	}
+	
+	reflex findNearestRescuer
+	{
+		list<rescuers> nearRescuers <- rescuers at_distance(hhPerceptionDistance+(hhPerceptionDistance/2));
+		
+		rescuers priority <- nearRescuers closest_to(self);
+		// priority is the rescuer that is nearest to the household agent
+	}
+	
+	reflex compute_HazardRelatedFactors
+	{
+		//float sourceOfEvacuationWarning <- 		RANDOM
+		
+		//proximityToHazard <- calculate_proximityToHazard(self.location distance_to hazard[0]);	
+		proximityToHazard <- calculate_proximityToHazard(self.location distance_to first(hazard));	
+		//write proximityToHazard;
+		HRF <- (stormSeverity + _rainfallSeverity + proximityToHazard + 
+			_sourceOfEvacuationWarning + _timeOfDay);
+		//write "hhID: " + hhID + "   HRF: " + HRF;
+	}
+	
+	reflex compute_PerceivedRisk
+	{
+		float boundedRationality <- rnd (0.0, 0.05); 	// between 0.0 and 0.05  
+		perceivedRisk <- ((CDM * weight_CDM) + (HRF * weight_HRF) + (CRF * weight_CRF)) + boundedRationality; 
+		hhHighestPossibleScore <- 8*weight_CDM + 3*weight_CRF + 5*weight_HRF;
+		write "hhID: " + hhID + "\tperceivedRisk: " + perceivedRisk + "\thhHighestPossibleScore: " + hhHighestPossibleScore; 
+		
+		if(perceivedRisk > hhHighestPossibleScore * 0.7)	{	evacuateNow <- true;	}
+		
+	}
+	
+	// Evacuate to evacuation centers inside the barangay
+	reflex evacuateToEC when: evacuateNow and availableEvacuationCenters > 0	//FIX the condition
+	{
+		// Look for nearby possible evacuation centers when alerted and evacuation centers inside
+		// the barangay are not full.  
+		// When not evacuating, wander. 
+		
+		householdsEvacuationPoints evacuation_point;
+		evacuationCenters evacuation_center;
+		volunteerShelters  volunteer_shelter;
+			
+		using topology(road_network) 
+		{
+			evacuation_center <- evacuationCenters with_min_of(each distance_to self);	
+			volunteer_shelter <- volunteerShelters  with_min_of(each distance_to self);				
+		}
+		
+		do goto target: evacuation_center on: road_network;
+		
+			 
+	}
+	
+	// Evacuate to evacuation centers outside the barangay
+	reflex evacuateToEP when: evacuateNow and availableEvacuationCenters = 0
+	{
+		// Look for nearby possible evacuation point when alerted and when evacuation centers inside 
+		// the barangay are full.
+		// When not evacuating, wander.
+		householdsEvacuationPoints evacuation_point;
+		
+		using topology(road_network) 
+		{
+			evacuation_point <- householdsEvacuationPoints with_min_of(each distance_to self);			
+		}
+		
+		do goto target: evacuation_point on: road_network;	
+	}
+	
+	reflex updateInputValues
+	{
+		//CONVERTING INPUT VALUES 
+		if(rainfallSeverity = "Yellow") 		{	_rainfallSeverity <- 0.4;	}
+		else if(rainfallSeverity = "Orange")	{	_rainfallSeverity <- 0.7;	}
+		else if(rainfallSeverity = "Red")		{	_rainfallSeverity <- 1.0;	}
+		
+		if(timeOfDay = "Day time")			{	_timeOfDay <- 0.5;	}
+		else if(timeOfDay = "Night time")	{	_timeOfDay <- 1.0;	}
+		
+		switch stormSeverity 
+		{
+			match 1	{	_stormSeverity <- 0.4;	}
+			match 2 {	_stormSeverity <- 0.7;	}
+			match 3	{	_stormSeverity <- 1.0;	}
+			default {	_stormSeverity <- 1.0;	}
+		}
+	}
+	
+	
+	/* ACTIONS */
+	action compute_CharacteristicsOfDecisionMaker	// one-time computation
+	{
+		float _headOfHousehold <- headOfHousehold = "male" ? 0.5: 1.0; 
+		float _incomeLevel <- nil; 
+		float _levelOfEducation <- nil;
+		float _hasSmallKids <- hasSmallKids = true ? 1.0: 0.0;
+		float _hasElderly <- hasElderly = true ? 1.0: 0.0;
+		float _withDisability <- withDisability = true ? 1.0: 0.0;
+		float _houseOwnership <- houseOwnership = true ? 0.5: 1.0;
+		float _yearsOfResidency <- yearsOfResidency = true ? 0.5: 1.0;
+		
+		
+		if(incomeLevel = "high")		{	_incomeLevel <- 0.4;	}
+		else if(incomeLevel = "middle")	{	_incomeLevel <- 0.7;	}
+		else if(incomeLevel = "low")	{	_incomeLevel <- 1.0;	}
+		
+		if(levelOfEducation = "college")			{	_levelOfEducation <- 0.4;	}
+		else if(levelOfEducation = "high school")	{	_levelOfEducation <- 0.7;	}
+		else if(levelOfEducation = "elementary")	{	_levelOfEducation <- 1.0;	}
+	
+		CDM <- (_headOfHousehold + _levelOfEducation + _hasSmallKids + _hasElderly+
+			_withDisability + _houseOwnership + _yearsOfResidency);
+	}
+	
+	action compute_CapacityRelatedFactors	//one-time computation
+	{
+		float _houseQuality <- 0.0;	//concrete=39%, wood/concrete+wodd=38%, light materials=23%
+		float _floorLevels <- floorLevels > 1 ? 0.5: 1.0;
+		float _pastTyphoonExperience <- pastTyphoonExperience = true ? 0.5: 1.0;
+		
+		if(houseQuality = "concrete")	{	_houseQuality <- 0.4;	}
+		else if(houseQuality = "wood")	{	_houseQuality <- 0.7;	}
+		else							{	_houseQuality <- 1.0;	}
+		
+		CRF <- (_houseQuality + _floorLevels + _pastTyphoonExperience);
+	}
+	
+	
+	float calculate_proximityToHazard(float distance)
+	{
+		if(distance > 40#m)			{	return 0.4;	}	// no-build zone is 40 m
+		else if(distance > 20#m)	{	return 0.7;	}	// near source of hazard
+		else						{	return 1.0;	}	// within the source of hazard
 	}
 	
 	aspect default 
 	{	
-		draw circle(2#m) color:stay ? #red : #yellow;
-//		draw circle(50#m) color: #cyan empty: true; //perception distance
+		//draw circle(3#m) color: alerted ? #red : #orange;
+		draw circle(3#m) color: evacuateNow ? #red : (alerted ? #violet : #orange);
+//		draw circle(hhPerceptionDistance) color: #cyan empty: true; //perception distance
 	}
 	
-	//BEHAVIORS ******************
-	//computeVitality()
-	//computeRiskPerceived()
-	//askForHelp()
-	//evacuate()
-	//helpNeighbor()
-	//cooperate()
-	//defect()
-	//countNeighbors()
+	/*
+	 * For PHASE II - N-Person Prisoner's Dilemma -----------------------------------------------------------------
+	 */
+	action askForHelp {}	
+	action helpNeighbor {}	
+	action cooperate {}
+	action defect {}
+	//compute_vitality
 	//die()
+	
+	
+	//// --------------------EQUATIONS -------------------
+//// Weighted Payoff
+//// given a household agent, 
+ 
+//float RP_wt <- 0.0; 
+//loop i from:1 to: 3 
+//{
+//	RP_wt <- RP_wt + W(i)*Mc(i);
+//}
+	//where W_i is a weighting parameter such that 
+	// all weights sum to one, and Mc_i is the history payoff
+	// (Mc_1 stores the current payoff. This assumes that 
+	// the effects of memory decrease with time, W_1 >= W_2 >= W_3. 
+
+//// Updating Scheme
+
+//if((S(t) = S(t-1)) and (S(t-1) = S(t-2)))
+//	alpha_i(t+1) <- alpha_i(t) + 0.15;
+//else if((S(t) = S(t-1)) and (S(t-1) != S(t-2)))
+//	alpha_i(t+1) <- alpha_i(t) + 0.10;
+//else if(S(t) != S(t-1))
+//	alpha_i(t+1) <- alpha_i(t) - 0.10;
+	
+//// Probability of Cooperation for household agent i at time t+1
+//// given time t,
+
+//if (S(t) = C and RP_wt > 0)
+//	p(t+1) <- p(t) + (1-p(t)) * alpha_i;
+//else if (S(t) = C and RP_wt <= 0)
+//	p(t+1) <- (1-alpha_i) * p(t);
+
+//// for every t, there must be q(t) = 1 - p(t)
+//// given time t,
+
+//if (S(t) = D and RP_wt > 0)
+//	q(t+1) <- q(t) + (1-q(t)) * alpha_i;
+//else if (S(t) = D and RP_wt <= 0)
+//	q(t+1) <- (1-alpha_i) * q(t);
+
+//// Neighborhood Production Function
+//// for time t, PF is the cooperation payoff for the group
+
+//int N <- neighborhood(j);
+//PF(t) <- 0.0;
+//loop j from:1 to: N	{	PF(t) <- PF(t) + C(j);	}
+//PF(t) <- PF(t) / N;
+
+	// where C_j is the payoff value for the agent j, 
+	// and N is the total number of agents in the neighborhood
+							
+//// Average Neighborhood Function for three memory events
+//float PFavg <- 0.0;
+//loop i from:1 to: 3		{	PFavg <- PFavg + PF(i);		} 
+//PFavg <- PFavg / 3;
+
+	
+//// State of agent i at time t+1 with S(t)
+//// for S(t) = C,
+
+//if (RP_wt for agent i < PF_avg and p(t+1) < q(t+1) and q(t+1) > R_u)
+//	S(t+1) <- D;
+//else 
+//	S(t+1) <- C;	// retain previous action if the conditions for D are not satisfied
+	
+//// for S(t) = D,
+
+//if (RP_wt for agent i < PF_avg and q(t+1) < p(t+1) and p(t+1) > R_u)
+//	S(t+1) <- C;
+//else 
+//	S(t+1) <- D;	// retain previous action if the conditions for C are not satisfied
+	
+// where R_u is a uniform random value between 0 and 1
+//// ----------------------------------------------------------------------------------------------------
+	
 }
 
 
-species rescuers skills:[moving] {
+species rescuers skills:[moving] 
+{
+	bool alerted <- false;
+//	bool directed <- true;
 	int capacity <- 0;
+	bool fullCapacity <- false;
 	int sensedHouseholds <- 0;
 	int sensedFellowRescuers <- 0;
 	float proximityToHazard <- 0.0;
@@ -144,15 +586,114 @@ species rescuers skills:[moving] {
 	float perceivedRisk <- 0.0;
 	float severityOfStorm <- 0.0;
 	float severityOfRainfall <- 0.0;	
+	//float perceptionDistance <- 50 #m;
+	point velocity <- {0,0};
+	point startPoint <- {0,0};
 	
 	float size <- 0.8 ;
 	rgb color <- rgb(141,211,199);
+	
+	rescuers rescuer;
+	rescuersStartingPoints startingPoint;
+	
+	list<households> householdAtVicinity update: households at_distance resPerceptionDistance;
+	list<rescuers> nearestFellowRescuers update: rescuers at_distance(resPerceptionDistance);
+	
+	
+//	reflex calculate_priority 
+//	{
+//		priority <- self.location distance_to hazard[0];
+//	}
+
+	reflex listNearestHouseholds 
+	{
+		/*
+		 * nearestHouseholds contains the list of all the household agents within the perception distance of the rescuer.
+		 */
+		//list<households> nearestHouseholds <- households at_distance(resPerceptionDistance);
 		
-	aspect default {
-//		if(load>=capacity)	{	draw triangle(10#m) color:#black;	}
-//		else				{	draw triangle(10#m) color:#green;	}
-		draw circle(2#m) color:#green;
-//		draw circle(50#m) color: #orange empty: true;	//perception distance
+		households priority <- households closest_to(self);
+		// priority contains the closest households agent from the rescuer agent.	
+	}
+	
+	reflex listNearestFellowRescuers
+	{
+		//list<rescuers> nearestFellowRescuers <- rescuers at_distance(resPerceptionDistance);
+		
+		rescuers priorityResc <- rescuers closest_to(self);
+	}
+	
+//	reflex warn when: directed //not alerted 
+//	{
+//		/**
+//		 * Warns households about the impending typhoon.
+//		 */
+//		if(empty((householdAtVicinity)))// where(each.fire_degree > 0))))
+//		{
+//			alerted <- false;
+//		}
+//		else {
+//			alerted <- true;
+//		}
+//	}
+	
+	reflex warn when: directed
+	{
+		/**
+		 * Look for a nearby destination point when directed by the disaster manager (MDRRMO).
+		 */
+		rescuersDestinationPoints destination_point;
+		//rescuersStartingPoints startPoint;
+		evacuationCenters evacuation_center;
+		volunteerShelters  volunteer_shelter;
+		
+		// Destination point at arbitrary near distance
+		list<rescuersDestinationPoints> destPoints <- rescuersDestinationPoints at_distance 0#m; 
+		
+		using topology(road_network) 
+		{
+			destination_point <- rescuersDestinationPoints with_min_of(each distance_to self);
+			
+			//evacuation_center <- evacuationCenters with_min_of(each distance_to self);	
+			//volunteer_shelter <- volunteerShelters  with_min_of(each distance_to self);		
+			//startPoint <- rescuersStartingPoints with_min_of(each distance_to self);	
+		}
+		
+		// Go to the nearest destination point
+		do goto target: destination_point on: road_network;	
+		
+		// Along the way, warn/inform the households that are within the perception distance about 
+		// the impending storm and recommend evacuation
+		loop hhagent over: householdAtVicinity	
+		{	
+			hhagent.alerted <- true;
+			hhagent._sourceOfEvacuationWarning <- 1.0;
+		}
+		
+		// Once a destination point has been reached by a rescuer, remove that destination point  
+		// from the environment so that the rescuer can proceed to other destination points.
+		ask destPoints	{	do die;	  }
+		
+		// If all destination points have been reached, then rescuers should go back to the 
+		// nearest starting point.
+		if(empty(rescuersDestinationPoints))	{	do goto target: startPoint on: road_network;	}	
+			
+	}
+	
+	action bounding 
+	{
+			if  (location.x) < xmin			{	velocity <- velocity + {xbounds,0};		} 
+			else if (location.x) > xmax 	{	velocity <- velocity - {xbounds,0};		}
+			
+			if (location.y) < ymin 			{	velocity <- velocity + {0,ybounds};		} 
+			else if (location.y) > ymax 	{	velocity <- velocity - {0,ybounds};		}	
+	}
+	
+	
+	aspect default 
+	{
+		draw circle(3#m) color: fullCapacity ? #blue : #green; 
+		draw circle(resPerceptionDistance) color: #orange empty: true;	//perception distance
 	}
 	
 	//BEHAVIORS *********************
@@ -198,25 +739,69 @@ species rescuers skills:[moving] {
 //				velocity <- velocity + {0,ybounds};
 //			} else if (location.y) > ymax {
 //				velocity <- velocity - {0,ybounds};
-//			}
-//			
-//		
+//			}	
 //	}
 
 }
 
+
+
 species shelterManagers 
 {
-	int capacity <- 0;
+	// a shelter manager is assigned to an evacuation center
+	evacuationCenters evacCenter;
+	
+	// the capacity of the evacuation center where the shelter manager 
+	// is assigned is also its capacity
+	//int capacity <- int(evacCenter.evacuationCenterCapacity);	
 	
 	float size <- 1.0 ;
-	rgb color <- rgb(255,255,179);
+	
+	
+	list<households> incomingEvacuees update: households at_distance sheltPerceptionDistance;
+	int acceptedEvacuees;
+	bool full;
+	households evacuee; 
+	
+	
+//	reflex checkCapacity
+//	{
+//		//write capacity + ": " + acceptedEvacuees;
+//		if(acceptedEvacuees < int(evacCenter.evacuationCenterCapacity))		
+//		{	
+//			//evacuateHouseholdsInside <- households at_distance 1#m;
+//			evacuee <- first(incomingEvacuees);
+//			do accept_evacuees();
+//		}
+//		else if(acceptedEvacuees = int(evacCenter.evacuationCenterCapacity))	
+//		{	
+//			full <- true;
+//			evacCenter.full <- true;
+//
+//			if(availableEvacuationCenters > 0)
+//			{
+//				availableEvacuationCenters <- availableEvacuationCenters - 1;
+//				//write "availableEvacuationCenters:" + availableEvacuationCenters;
+//			}		
+//		}
+//	}
+//	
+//	action accept_evacuees
+//	{
+//		ask evacuee 
+//		{
+//			myself.acceptedEvacuees <- myself.acceptedEvacuees + 1;
+//			evacuated_inside <- evacuated_inside + 1;
+//			do die;
+//		}
+//	}
 		
 	aspect default 
 	{
 		draw circle(2#m) color:#blue;
-//		draw circle(50#m) color: #purple empty: true;	//perception distance
+		draw circle(sheltPerceptionDistance) color: #purple empty: true;	//perception distance
 	}
+
 	
 	//BEHAVIORS *************
 	//countEvacuees()
@@ -226,18 +811,21 @@ species shelterManagers
 
 species building 
 {
+	float houseMaterial <- 0.0;
+	float distanceFromHazardSource <- 0.0;
+	
 	aspect default 
 	{
 		draw shape color: #gray border: #black;
 	}
 }
 
-species hazard {
+species hazard 
+{
+	float speed <- 5#m/30#mn;
 	
-	
-	float speed <- 5#m/#mn;
-	
-	init {
+	init 
+	{
 		catastrophe_date <- current_date + time_before_hazard;
 	}
 	
@@ -264,7 +852,9 @@ species hazard {
 //	aspect default {
 //		draw shape color:#blue;
 //	}
-	
+	aspect default {
+		draw (shape + 9) intersection world color: #blue;
+	}
 }
 
 
@@ -293,34 +883,181 @@ species road
 	}
 }
 
-species evacuation_point 
+//species evacuation_point 
+//{
+//	int count_exit <- 0;
+//	
+//	action evacue_inhabitant 
+//	{
+//		count_exit <- count_exit + 1;
+//	}
+//}
+
+species rescuersStartingPoints
 {
-	int count_exit <- 0;
+	int count_start <- 0;
 	
-	action evacue_inhabitant 
+	aspect default 
 	{
-		count_exit <- count_exit + 1;
+		draw shape + 8 color: #green border: #black;
+	}
+	
+	action gatherRescuers
+	{
+		count_start <- count_start + 1;
+	}
+}
+
+species householdsEvacuationPoints
+{
+	// Species that represents households evacuation points
+    // Households that are nearby these evacuation points get evacuated from the hazard.
+	
+	int count_start <- 0;
+	
+	aspect default 
+	{
+		draw shape + 8 color: #violet border: #black;
+	}
+	
+	reflex evacuate_households
+	{
+		//Evacuates nearby households.
+		list<households> evacuateHouseholdsOutside <- households at_distance 0#m; // arbitrary near distance
+		
+		ask evacuateHouseholdsOutside 
+		{
+			evacuated_outside <- evacuated_outside + 1;
+			do die;
+		}
+	}
+	
+	action collectEvacuees
+	{
+		count_start <- count_start + 1;
+	}
+}
+
+species evacuationCenters
+{
+	shelterManagers evacCenterManager;
+	string evacuationCenterCapacity;
+	int acceptedEvacuees;
+	bool full;
+	households evacuee; 
+	
+	//list<households> evacuateHouseholdsInside update: households at_distance 0#m; // arbitrary near distance
+	list<households> evacuateHouseholdsInside;
+	
+	reflex checkCapacity
+	{
+		//write evacuationCenterCapacity + ": " + acceptedEvacuees;
+//		ask self
+//		{
+		if(acceptedEvacuees < int(evacuationCenterCapacity))		
+		{	
+			evacuateHouseholdsInside <- households at_distance 0#m;
+			evacuee <- first(evacuateHouseholdsInside);
+			do accept_evacuees(evacuee);
+		}
+		else if(acceptedEvacuees = int(evacuationCenterCapacity))	
+		{	
+			full <- true;
+
+			if(availableEvacuationCenters > 0)
+			{
+				availableEvacuationCenters <- availableEvacuationCenters - 1;
+				write "availableEvacuationCenters:" + availableEvacuationCenters;
+			}		
+		}
+		//}
+	}
+	
+	action accept_evacuees(households evac)
+	{
+		ask evac 
+		{
+			myself.acceptedEvacuees <- myself.acceptedEvacuees + 1;
+			evacuated_inside <- evacuated_inside + 1;
+			do die;
+		}
+	}
+	
+
+	aspect default 
+	{
+		draw shape color: (acceptedEvacuees < int(evacuationCenterCapacity)) ? #cyan : #red  border: #black;
+	}
+}
+
+species volunteerShelters
+{
+	string volunteerShelterCapacity;
+	int acceptedVEvacuees;
+	bool full;
+	
+	reflex checkCapacity
+	{
+		ask self
+		{
+			if(acceptedVEvacuees = volunteerShelterCapacity)
+			{
+				full <- true;
+			}
+		}
+	}
+	
+	aspect default 
+	{
+		draw shape color: #yellowgreen border: #black;
+	}
+}
+
+species rescuersDestinationPoints
+{
+	bool reached;
+	
+	aspect default
+	{
+		draw shape color: #orange;
 	}
 }
 
 
-
 experiment typhoon_evacuation_behavior type: gui 
 {
-	parameter "Number of Households: " var: nb_households_init min: 10 max: 1007 category: "Agents" ;
-	parameter "Number of Rescuers: 	 " var: nb_rescuers_init   min: 5 max: 20 category: "Agents" ;
-	parameter "Number of Shelter Managers: " var: nb_shelterManagers_init min: 2 max: 5 category: "Agents" ;
+	parameter "Direct Rescuers" var: directed <- false;
+	parameter "Storm Severity"  var: stormSeverity init:1 min:1 max:5 step:1;
+	parameter "Rainfall Classification"  var: rainfallSeverity init:"Yellow" among:["Red","Orange","Yellow"];// category: "Rainfall Classification";
+	parameter "Time of Day"  var: timeOfDay init:"Daytime" among:["Daytime","Night time"];
+	parameter "Time before hazard" var:time_before_hazard init:2#h min:2#h max:4#h;
 	
-	parameter "Time before hazard" var:time_before_hazard init:1#h min:5#mn max:2#h;
+	//parameter "Households: " var: nb_households_init min: 20 max: 577 category: "Number of Agents" ;
+	parameter "Rescuers: " var: nb_rescuers_init   min: 8 max: 20 category: "Number of Agents" ;
+	parameter "Shelter Managers: " var: nb_shelterManagers_init min: 1 max: 4 category: "Number of Agents" ;
+	
+	parameter "Household: " var: hhPerceptionDistance min: 50#m max: 100#m category: "Perception Distance";
+	parameter "Rescuer: " var: resPerceptionDistance min: 50#m max: 100#m category: "Perception Distance";
+	parameter "Shelter Manager: " var: sheltPerceptionDistance min: 50#m max: 100#m category: "Perception Distance";
+	
+	parameter "Weight for CDM: " var: weight_CDM init: 0.4 min: 0.1 max: 0.9 step: 0.1 category: "Weights";
+	parameter "Weight for HRF: " var: weight_HRF init: 0.4 min: 0.1 max: 0.9 step: 0.1 category: "Weights";
+	parameter "Weight for CRF: " var: weight_CRF init: 0.2 min: 0.1 max: 0.9 step: 0.1 category: "Weights";
+	//parameter "Initial Probability of Cooperation" var:init_probability_cooperation init:0.5 min:0.0 max:1.0;
 	
 	output 
 	{
 		display main_display type:opengl 
 		{ 
 			species road;
-			species evacuation_point;
+			species rescuersDestinationPoints;
+			species rescuersStartingPoints;
+			species householdsEvacuationPoints;
+			//species evacuation_point;
 			species hazard;
 			species building;
+			species evacuationCenters;
+			species volunteerShelters;
 			species households;
 			species rescuers;
 			species shelterManagers;
@@ -329,18 +1066,24 @@ experiment typhoon_evacuation_behavior type: gui
 		display info_display type:opengl 
 		{ 
 			species road;
-			species evacuation_point;
+			species rescuersDestinationPoints;
+			species rescuersStartingPoints;
+			species householdsEvacuationPoints;
+			//species evacuation_point;
 			species hazard;
 			species building;
+			
+			species evacuationCenters;
+			species volunteerShelters;
 			species households;
 			species rescuers;
 			species shelterManagers;
 		}
 						
-//		monitor "Number of Households" value: nb_households_init ;
-//		monitor "Number of Rescuers" value: nb_rescuers_init ;
-//		monitor "Number of Shelter Managers" value: nb_shelterManagers_init;
-//		
+		monitor "Evacuated: Inside Barangay" value: evacuated_inside ;
+		monitor "Evacuated: Outside Barangay" value: evacuated_outside ;
+		monitor "Total Evacuees" value: evacuated_inside + evacuated_outside ;
+			
 	}
 }
 
